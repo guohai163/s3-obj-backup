@@ -245,7 +245,26 @@ func (s *Service) execute(ctx context.Context, id int64, r Run, t Task, c *Count
 			}
 			return s.visitCandidates(ctx, id, copy)
 		}
-		return src.list(ctx, t.Settings.SourcePrefix, func(o Object) error { c.Scanned++; return copy(o) })
+		var unstable int64
+		var firstUnstable string
+		err = src.list(ctx, t.Settings.SourcePrefix, func(o Object) error {
+			c.Scanned++
+			err := copy(o)
+			if !errors.Is(err, errSourceUnstable) {
+				return err
+			}
+			if unstable == 0 {
+				firstUnstable = o.Key
+			}
+			unstable++
+			return s.markProgress(ctx, id, *c)
+		})
+		if unstable > 0 {
+			err = errors.Join(err, fmt.Errorf(
+				"Could not copy %d source objects that changed or disappeared during backup. First affected key is %q.",
+				unstable, firstUnstable))
+		}
+		return err
 	}
 	return fmt.Errorf("unknown task type %q", t.Kind)
 }

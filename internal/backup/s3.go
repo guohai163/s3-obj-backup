@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -115,6 +116,57 @@ func (b remoteBucket) get(ctx context.Context, key, etag string) (io.ReadCloser,
 	return body, info, err
 }
 
+func (b remoteBucket) refreshObject(ctx context.Context, key string) (Object, error) {
+	for entry := range b.client.ListObjectsIter(ctx, b.name, minio.ListObjectsOptions{
+		Prefix: key, Recursive: true, MaxKeys: 1,
+	}) {
+		if entry.Err != nil {
+			return Object{}, entry.Err
+		}
+		// An exact key sorts before any longer key with that prefix.
+		if entry.Key == key {
+			return Object{Key: key, Size: entry.Size, Modified: entry.LastModified, ETag: entry.ETag}, nil
+		}
+		break
+	}
+	if err := ctx.Err(); err != nil {
+		return Object{}, err
+	}
+	return Object{}, errChanged
+}
+
+var errSourceUnstable = errors.New("source object changed or disappeared during backup")
+
+func (b remoteBucket) openCopySource(ctx context.Context, listed Object, move bool) (io.ReadCloser, minio.ObjectInfo, Object, error) {
+	// Refresh normal backups only. Moves must use the object selected before deletion.
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		body, info, err := b.get(ctx, listed.Key, listed.ETag)
+		if err == nil {
+			if sameObject(listed, info) {
+				return body, info, listed, nil
+			}
+			body.Close()
+			err = errChanged
+		}
+		response := minio.ToErrorResponse(err)
+		if move || !(errors.Is(err, errChanged) || objectMissing(err) ||
+			response.StatusCode == http.StatusPreconditionFailed || response.Code == "PreconditionFailed") {
+			return nil, minio.ObjectInfo{}, Object{}, fmt.Errorf("read source: %w", err)
+		}
+		if attempt == attempts {
+			return nil, minio.ObjectInfo{}, Object{}, errSourceUnstable
+		}
+		listed, err = b.refreshObject(ctx, listed.Key)
+		if errors.Is(err, errChanged) {
+			return nil, minio.ObjectInfo{}, Object{}, errSourceUnstable
+		}
+		if err != nil {
+			return nil, minio.ObjectInfo{}, Object{}, fmt.Errorf("refresh source listing: %w", err)
+		}
+	}
+}
+
 func uploadOptions(info minio.ObjectInfo) minio.PutObjectOptions {
 	options := minio.PutObjectOptions{
 		ContentType: info.ContentType, ContentEncoding: info.Metadata.Get("Content-Encoding"),
@@ -153,14 +205,11 @@ func (s *Service) copyObject(ctx context.Context, t Task, src, dst remoteBucket,
 		}
 	}
 
-	source, info, err := src.get(ctx, o.Key, o.ETag)
+	source, info, o, err := src.openCopySource(ctx, o, t.Settings.Move)
 	if err != nil {
-		return fmt.Errorf("read source: %w", err)
+		return err
 	}
 	defer source.Close()
-	if !sameObject(o, info) {
-		return errChanged
-	}
 
 	var input io.Reader = source
 	hash := sha256.New()

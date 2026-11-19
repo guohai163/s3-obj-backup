@@ -87,6 +87,31 @@ func TestBackupWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondary.Close()
+	// Overwrite two fixture objects between LIST and the conditional GET.
+	// The first settles after one update. The second keeps changing.
+	var recovered, unstable int
+	s.transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req.Method == http.MethodGet && req.Header.Get("If-Match") != "" {
+			key, inSource := strings.CutPrefix(req.URL.Path, "/"+sourceName+"/")
+			var revision int
+			switch {
+			case inSource && key == "updates/01-recovered" && recovered == 0:
+				recovered++
+				revision = recovered
+			case inSource && key == "updates/02-unstable" && unstable < 3:
+				unstable++
+				revision = unstable
+			}
+			if revision != 0 {
+				body := fmt.Sprintf("revision %d", revision)
+				if _, err := remote.PutObject(req.Context(), sourceName, key, strings.NewReader(body),
+					int64(len(body)), minio.PutObjectOptions{}); err != nil {
+					return nil, fmt.Errorf("update test fixture: %w", err)
+				}
+			}
+		}
+		return http.ProxyFromEnvironment(req)
+	}
 	server := httptest.NewServer(s.Handler())
 	defer server.Close()
 	workerCtx, stop := context.WithCancel(ctx)
@@ -134,8 +159,12 @@ func TestBackupWorkflow(t *testing.T) {
 			}
 		}
 	}
-	waitRun := func(taskID int64, mode string, after int64) Run {
+	waitRun := func(taskID int64, mode string, after int64, expectedState ...string) Run {
 		t.Helper()
+		want := "success"
+		if len(expectedState) != 0 {
+			want = expectedState[0]
+		}
 		deadline := time.Now().Add(35 * time.Second)
 		for time.Now().Before(deadline) {
 			var runs []Run
@@ -144,10 +173,10 @@ func TestBackupWorkflow(t *testing.T) {
 				if r.TaskID != taskID || r.ID <= after || r.Mode != mode {
 					continue
 				}
-				if r.State == "failed" {
-					t.Fatalf("run %d %s: %s", r.ID, mode, r.Detail)
-				}
-				if r.State == "success" {
+				if r.State == "failed" || r.State == "success" {
+					if r.State != want {
+						t.Fatalf("run %d %s: got %s, want %s: %s", r.ID, mode, r.State, want, r.Detail)
+					}
 					return r
 				}
 			}
@@ -290,6 +319,34 @@ func TestBackupWorkflow(t *testing.T) {
 	}
 	if _, err := remote.StatObject(ctx, sourceName, "incoming/new", minio.StatObjectOptions{}); !objectMissing(err) {
 		t.Fatalf("source should be removed, got %v", err)
+	}
+
+	put("updates/01-recovered", []byte("initial"))
+	put("updates/02-unstable", []byte("initial"))
+	put("updates/03-later", []byte("stable"))
+	updates := save(Task{Name: "Back up changing objects", Kind: "backup", SourceID: source.ID, TargetID: &target.ID,
+		Settings: Settings{SourcePrefix: "updates", TargetPrefix: "updates"}}, 200)
+	submit(updates, "manual", nil, false, 202)
+	partial := waitRun(updates.ID, "manual", 0, "failed")
+	if partial.Scanned != 3 || partial.Copied != 2 || partial.Skipped != 0 ||
+		!strings.Contains(partial.Detail, "Could not copy 1 source objects") || !strings.Contains(partial.Detail, "02-unstable") {
+		t.Fatalf("expected only the continuously changing object to remain pending: %+v", partial)
+	}
+	for key, want := range map[string]string{"updates/01-recovered": "revision 1", "updates/03-later": "stable"} {
+		object, err := remote.GetObject(ctx, targetName, key, minio.GetObjectOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(object)
+		object.Close()
+		if err != nil || string(data) != want {
+			t.Fatalf("%s: got %q, want %q, err=%v", key, data, want, err)
+		}
+	}
+	submit(updates, "manual", nil, false, 202)
+	resumed := waitRun(updates.ID, "manual", partial.ID)
+	if resumed.Copied != 1 || resumed.Skipped != 2 {
+		t.Fatalf("expected the next run to reuse both valid checkpoints: %+v", resumed)
 	}
 	request(viewer, "POST", "/api/logout", map[string]any{}, 200, nil)
 	request(viewer, "GET", "/api/config", nil, 401, nil)
