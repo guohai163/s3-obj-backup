@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/s3-obj-backup
+.DS_Store
