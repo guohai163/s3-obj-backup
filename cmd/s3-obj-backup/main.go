@@ -51,10 +51,19 @@ func run() error {
 			return errors.New("COOKIE_SECURE must be true or false")
 		}
 	}
+	backupWorkers := 0
+	if raw := os.Getenv("BACKUP_WORKERS"); raw != "" {
+		var err error
+		backupWorkers, err = strconv.Atoi(raw)
+		if err != nil || backupWorkers < 1 || backupWorkers > 8 {
+			return errors.New("BACKUP_WORKERS must be between 1 and 8")
+		}
+	}
 	cfg := backup.Config{
 		DatabaseURL: os.Getenv("DATABASE_URL"), EncryptionKey: os.Getenv("APP_ENCRYPTION_KEY"),
 		AdminUser: os.Getenv("ADMIN_USER"), AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 		ViewerUser: os.Getenv("VIEWER_USER"), ViewerPassword: os.Getenv("VIEWER_PASSWORD"), SecureCookie: secure,
+		BackupWorkers: backupWorkers,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 )
 
 func (s *Service) Work(ctx context.Context) {
@@ -227,46 +228,110 @@ func (s *Service) execute(ctx context.Context, id int64, r Run, t Task, c *Count
 		if err != nil {
 			return err
 		}
-		copy := func(o Object) error {
+		copy := func(ctx context.Context, o Object, counts *Counts) error {
 			key := t.Settings.TargetPrefix + strings.TrimPrefix(o.Key, t.Settings.SourcePrefix)
 			if key == "" {
 				// An S3 folder marker at the source prefix has no key at a bucket root.
-				c.Skipped++
+				counts.Skipped++
 				return nil
 			}
-			if err := s.copyObject(ctx, t, src, dst, o, key, c); err != nil {
-				return err
-			}
-			return s.markProgress(ctx, id, *c)
+			return s.copyObject(ctx, t, src, dst, o, key, counts)
 		}
 		if t.Settings.Move {
 			if err := s.stage(ctx, id, src, t.Settings.SourcePrefix, nil, c); err != nil {
 				return err
 			}
-			return s.visitCandidates(ctx, id, copy)
+			return s.visitCandidates(ctx, id, func(o Object) error {
+				if err := copy(ctx, o, c); err != nil {
+					return err
+				}
+				return s.markProgress(ctx, id, *c)
+			})
 		}
-		var unstable int64
-		var firstUnstable string
-		err = src.list(ctx, t.Settings.SourcePrefix, func(o Object) error {
-			c.Scanned++
-			err := copy(o)
-			if !errors.Is(err, errSourceUnstable) {
-				return err
-			}
-			if unstable == 0 {
-				firstUnstable = o.Key
-			}
-			unstable++
-			return s.markProgress(ctx, id, *c)
-		})
-		if unstable > 0 {
-			err = errors.Join(err, fmt.Errorf(
-				"Could not copy %d source objects that changed or disappeared during backup. First affected key is %q.",
-				unstable, firstUnstable))
-		}
-		return err
+		return s.backupObjects(ctx, id, src, t.Settings.SourcePrefix, c, copy)
 	}
 	return fmt.Errorf("unknown task type %q", t.Kind)
+}
+
+func (s *Service) backupObjects(ctx context.Context, id int64, src remoteBucket, prefix string, counts *Counts,
+	copy func(context.Context, Object, *Counts) error,
+) error {
+	work, cancel := context.WithCancel(ctx)
+	defer cancel()
+	group, work := errgroup.WithContext(work)
+	jobs := make(chan Object)
+	type result struct {
+		counts   Counts
+		unstable string
+	}
+	results := make(chan result, s.cfg.BackupWorkers)
+	group.Go(func() error {
+		defer close(jobs)
+		return src.list(work, prefix, func(object Object) error {
+			select {
+			case jobs <- object:
+				return nil
+			case <-work.Done():
+				return work.Err()
+			}
+		})
+	})
+	for range s.cfg.BackupWorkers {
+		group.Go(func() error {
+			for object := range jobs {
+				if err := work.Err(); err != nil {
+					return err
+				}
+				var item result
+				err := copy(work, object, &item.counts)
+				if errors.Is(err, errSourceUnstable) {
+					item.unstable = object.Key
+					err = nil
+				}
+				results <- item
+				if err != nil {
+					return objectError(object.Key, err)
+				}
+			}
+			return nil
+		})
+	}
+	outcome := make(chan error, 1)
+	go func() {
+		outcome <- group.Wait()
+		close(results)
+	}()
+	var unstable int64
+	var firstUnstable string
+	var progressErr error
+	// Only this goroutine updates the run's shared totals.
+	for item := range results {
+		counts.Scanned++
+		counts.Copied += item.counts.Copied
+		counts.Skipped += item.counts.Skipped
+		if item.unstable != "" {
+			if unstable == 0 {
+				firstUnstable = item.unstable
+			}
+			unstable++
+		}
+		if progressErr == nil {
+			progressErr = s.markProgress(ctx, id, *counts)
+			if progressErr != nil {
+				cancel()
+			}
+		}
+	}
+	err := <-outcome
+	if progressErr != nil {
+		return progressErr
+	}
+	if unstable == 0 {
+		return err
+	}
+	return errors.Join(err, fmt.Errorf(
+		"Could not copy %d source objects that changed or disappeared during backup. First affected key is %q.",
+		unstable, firstUnstable))
 }
 
 func (s *Service) stage(ctx context.Context, id int64, src remoteBucket, prefix string, cutoff *time.Time, c *Counts) error {

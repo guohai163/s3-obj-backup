@@ -29,6 +29,7 @@ type Config struct {
 	ViewerUser     string
 	ViewerPassword string
 	SecureCookie   bool
+	BackupWorkers  int
 }
 
 type Service struct {
@@ -40,6 +41,12 @@ type Service struct {
 }
 
 func Open(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
+	if cfg.BackupWorkers == 0 {
+		cfg.BackupWorkers = 4
+	}
+	if cfg.BackupWorkers < 1 || cfg.BackupWorkers > 8 {
+		return nil, errors.New("BACKUP_WORKERS must be between 1 and 8")
+	}
 	if cfg.AdminUser == "" || len(cfg.AdminPassword) < 12 {
 		return nil, errors.New("ADMIN_USER and ADMIN_PASSWORD (at least 12 bytes) are required")
 	}
@@ -77,6 +84,7 @@ func Open(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableCompression = true
+	transport.MaxIdleConnsPerHost = cfg.BackupWorkers + 2
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	s := &Service{db: db, cipher: aead, cfg: cfg, log: log, transport: transport}
 	if err := s.migrate(ctx); err != nil {

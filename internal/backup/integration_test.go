@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,17 +91,27 @@ func TestBackupWorkflow(t *testing.T) {
 	// Overwrite two fixture objects between LIST and the conditional GET.
 	// The first settles after one update. The second keeps changing.
 	var recovered, unstable int
+	concurrentRead := make(chan struct{})
+	var concurrentReadOnce sync.Once
 	s.transport.Proxy = func(req *http.Request) (*url.URL, error) {
 		if req.Method == http.MethodGet && req.Header.Get("If-Match") != "" {
 			key, inSource := strings.CutPrefix(req.URL.Path, "/"+sourceName+"/")
 			var revision int
 			switch {
 			case inSource && key == "updates/01-recovered" && recovered == 0:
+				// The later key must reach GET while the first key is still in flight.
+				select {
+				case <-concurrentRead:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
 				recovered++
 				revision = recovered
 			case inSource && key == "updates/02-unstable" && unstable < 3:
 				unstable++
 				revision = unstable
+			case inSource && key == "updates/03-later":
+				concurrentReadOnce.Do(func() { close(concurrentRead) })
 			}
 			if revision != 0 {
 				body := fmt.Sprintf("revision %d", revision)
